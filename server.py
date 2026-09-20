@@ -12,6 +12,10 @@ import platform
 import sqlite3
 import argparse
 import pathlib
+import threading
+import shutil
+import csv
+from io import StringIO
 from collections import defaultdict
 from typing import Dict, Any, Iterable
 from pathlib import Path
@@ -1008,6 +1012,301 @@ def generate_standalone_html(chat):
         logger.error(f"Error generating HTML for session {chat.get('session_id', 'N/A')}: {e}", exc_info=True)
         # Return an HTML formatted error message
         return f"<html><body><h1>Error generating chat export</h1><p>Error: {e}</p></body></html>"
+
+################################################################################
+# Batch Export Functionality
+################################################################################
+
+# Global dictionary to track batch export operations
+batch_exports: Dict[str, Dict[str, Any]] = {}
+batch_export_lock = threading.Lock()
+
+def log_batch_export(message: str):
+    """Log a message to the batch export log file."""
+    try:
+        log_dir = pathlib.Path.home() / "cursor-conversations"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "batchExport.log"
+        
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] {message}\n"
+        
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(log_entry)
+    except Exception as e:
+        logger.error(f"Error writing to batch export log: {e}")
+
+def save_blob_info(conversation_folder: pathlib.Path, label: str, blob_data: Any):
+    """Save blob information to the blob_info file."""
+    try:
+        blob_file = conversation_folder / "blob_info"
+        
+        # Prepare the log entry
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] {label}\n"
+        
+        # Convert blob data to string representation
+        if isinstance(blob_data, (dict, list)):
+            blob_str = json.dumps(blob_data, indent=2, ensure_ascii=False)
+        else:
+            blob_str = str(blob_data)
+        
+        log_entry += f"{blob_str}\n"
+        log_entry += "-" * 80 + "\n"
+        
+        # Write to file (append mode)
+        with open(blob_file, "a", encoding="utf-8") as f:
+            f.write(log_entry)
+            
+    except Exception as e:
+        logger.error(f"Error saving blob info: {e}")
+
+def perform_batch_export(batch_id: str):
+    """Perform the actual batch export operation in a background thread."""
+    try:
+        with batch_export_lock:
+            batch_exports[batch_id]["status"] = "started"
+            batch_exports[batch_id]["errors"] = []
+            batch_exports[batch_id]["saved_conversations"] = []
+            batch_exports[batch_id]["total_conversations"] = 0
+        
+        log_batch_export(f"Starting batch export {batch_id}")
+        
+        # Extract all chats
+        chats = extract_chats()
+        
+        with batch_export_lock:
+            batch_exports[batch_id]["total_conversations"] = len(chats)
+        
+        log_batch_export(f"Found {len(chats)} conversations to export")
+        
+        # Process each conversation
+        for i, chat in enumerate(chats):
+            try:
+                # Get conversation details
+                session_id = chat.get('session', {}).get('composerId', 'unknown')
+                project = chat.get('project', {})
+                workspace_name = project.get('name', 'unknown')
+                
+                # Clean workspace name for folder path
+                workspace_name_clean = workspace_name.replace('/', '-').replace('\\', '-').replace(':', '-')
+                
+                # Create conversation folder path
+                base_dir = pathlib.Path.home() / "cursor-conversations"
+                conversation_folder = base_dir / workspace_name_clean / session_id
+                
+                # Log the start of processing this conversation
+                log_batch_export(f"Processing conversation {i+1}/{len(chats)}: {session_id}")
+                
+                # Delete and recreate folder if it exists
+                if conversation_folder.exists():
+                    shutil.rmtree(conversation_folder)
+                    log_batch_export(f"Deleted existing folder: {conversation_folder}")
+                
+                conversation_folder.mkdir(parents=True, exist_ok=True)
+                log_batch_export(f"Created folder: {conversation_folder}")
+                
+                # Delete existing blob_info file if it exists to start fresh
+                blob_file = conversation_folder / "blob_info"
+                if blob_file.exists():
+                    blob_file.unlink()
+                    log_batch_export(f"Deleted existing blob_info file: {blob_file}")
+                
+                # Save blob info for the raw chat data (this will create a new file)
+                save_blob_info(conversation_folder, "Raw chat data from extract_chats()", chat)
+                
+                # Format chat for frontend
+                formatted_chat = format_chat_for_frontend(chat)
+                save_blob_info(conversation_folder, "Formatted chat data for frontend", formatted_chat)
+                
+                # Generate and save HTML export
+                html_content = generate_standalone_html(formatted_chat)
+                html_file = conversation_folder / f"cursor-chat-{session_id[:8]}.html"
+                with open(html_file, "w", encoding="utf-8") as f:
+                    f.write(html_content)
+                log_batch_export(f"Saved HTML export: {html_file}")
+                save_blob_info(conversation_folder, f"HTML content length: {len(html_content)} characters", {"length": len(html_content)})
+                
+                # Generate and save JSON export
+                json_content = json.dumps(formatted_chat, indent=2, ensure_ascii=False)
+                json_file = conversation_folder / f"cursor-chat-{session_id[:8]}.json"
+                with open(json_file, "w", encoding="utf-8") as f:
+                    f.write(json_content)
+                log_batch_export(f"Saved JSON export: {json_file}")
+                save_blob_info(conversation_folder, f"JSON content length: {len(json_content)} characters", {"length": len(json_content)})
+                
+                # Update progress
+                with batch_export_lock:
+                    batch_exports[batch_id]["saved_conversations"].append({
+                        "session_id": session_id,
+                        "workspace": workspace_name,
+                        "path": str(conversation_folder)
+                    })
+                
+                log_batch_export(f"Successfully exported conversation {i+1}/{len(chats)}: {session_id}")
+                
+            except Exception as e:
+                error_msg = f"Error processing conversation {chat.get('session', {}).get('composerId', 'unknown')}: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                log_batch_export(error_msg)
+                
+                with batch_export_lock:
+                    batch_exports[batch_id]["errors"].append({
+                        "session_id": chat.get('session', {}).get('composerId', 'unknown'),
+                        "error": str(e)
+                    })
+        
+        # Mark as completed
+        with batch_export_lock:
+            batch_exports[batch_id]["status"] = "finished"
+        
+        log_batch_export(f"Batch export {batch_id} completed. Total: {len(chats)}, Saved: {len(batch_exports[batch_id]['saved_conversations'])}, Errors: {len(batch_exports[batch_id]['errors'])}")
+        
+    except Exception as e:
+        error_msg = f"Batch export {batch_id} failed: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        log_batch_export(error_msg)
+        
+        with batch_export_lock:
+            batch_exports[batch_id]["status"] = "failed"
+            batch_exports[batch_id]["errors"].append({
+                "session_id": "global",
+                "error": str(e)
+            })
+
+@app.route('/api/batchExport', methods=['POST'])
+def start_batch_export():
+    """Start a batch export operation."""
+    try:
+        logger.info("Received request to start batch export")
+        
+        # Generate a unique batch ID
+        batch_id = str(uuid.uuid4())
+        
+        # Initialize batch export state
+        with batch_export_lock:
+            batch_exports[batch_id] = {
+                "status": "initialized",
+                "errors": [],
+                "saved_conversations": [],
+                "total_conversations": 0
+            }
+        
+        # Start the batch export in a background thread
+        thread = threading.Thread(target=perform_batch_export, args=(batch_id,))
+        thread.daemon = True
+        thread.start()
+        
+        logger.info(f"Started batch export with ID: {batch_id}")
+        return jsonify({"batchSaveId": batch_id})
+        
+    except Exception as e:
+        logger.error(f"Error starting batch export: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/batchExportStatus', methods=['GET'])
+def get_batch_export_status():
+    """Get the status of a batch export operation."""
+    try:
+        batch_id = request.args.get('batchSaveId')
+        if not batch_id:
+            return jsonify({"error": "batchSaveId parameter is required"}), 400
+        
+        with batch_export_lock:
+            if batch_id not in batch_exports:
+                return jsonify({"error": "Batch export not found"}), 404
+            
+            status_info = batch_exports[batch_id].copy()
+        
+        return jsonify(status_info)
+        
+    except Exception as e:
+        logger.error(f"Error getting batch export status: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/exportCSV', methods=['GET'])
+def export_csv():
+    """Export all conversations as a single CSV file."""
+    try:
+        logger.info("Received request to export conversations as CSV")
+        
+        # Extract all chats
+        chats = extract_chats()
+        logger.info(f"Found {len(chats)} conversations to export as CSV")
+        
+        # Create CSV content using StringIO
+        csv_buffer = StringIO()
+        csv_writer = csv.writer(csv_buffer, quoting=csv.QUOTE_ALL)
+        
+        # Write header
+        csv_writer.writerow(['Project', 'sessionId', 'Title', 'createdAt', 'lastUpdatedAt', 'Messages'])
+        
+        for chat in chats:
+            try:
+                # Extract data from raw chat
+                project = chat.get('project', {})
+                session = chat.get('session', {})
+                messages = chat.get('messages', [])
+                
+                project_name = project.get('name', 'unknown')
+                session_id = session.get('composerId', 'unknown')
+                title = session.get('title', 'untitled')
+                created_at = session.get('createdAt', '')
+                last_updated = session.get('lastUpdatedAt', '')
+                
+                # Format messages as a single string with role markers
+                messages_str = ''
+                for msg in messages:
+                    role = msg.get('role', 'unknown')
+                    content = msg.get('content', '')
+                    # Replace newlines with spaces
+                    content = content.replace('\n', ' ').replace('\r', ' ')
+                    messages_str += f"[{role}]: {content} | "
+                
+                # Remove trailing separator
+                messages_str = messages_str.rstrip(' | ')
+                
+                # Format timestamps
+                if created_at:
+                    created_at = str(created_at)
+                if last_updated:
+                    last_updated = str(last_updated)
+                
+                # Write row to CSV
+                csv_writer.writerow([
+                    project_name,
+                    session_id,
+                    title,
+                    created_at,
+                    last_updated,
+                    messages_str
+                ])
+                
+            except Exception as e:
+                logger.error(f"Error processing chat for CSV: {e}")
+                continue
+        
+        # Get CSV content
+        csv_content = csv_buffer.getvalue()
+        
+        # Generate filename with timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"cursor_conversations_{timestamp}.csv"
+        
+        logger.info(f"Generated CSV with {len(chats)} rows")
+        
+        return Response(
+            csv_content,
+            mimetype="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in export_csv: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 # Serve React app
 @app.route('/', defaults={'path': ''})

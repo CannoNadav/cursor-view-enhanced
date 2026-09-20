@@ -6,6 +6,7 @@ import CssBaseline from '@mui/material/CssBaseline';
 import ChatList from './components/ChatList';
 import ChatDetail from './components/ChatDetail';
 import Header from './components/Header';
+import BatchExport from './components/BatchExport';
 
 // Define our color palette centrally - using rich, modern colors
 const colors = {
@@ -165,6 +166,7 @@ function App() {
         <Routes>
           <Route path="/" element={<ChatList />} />
           <Route path="/chat/:sessionId" element={<ChatDetail />} />
+          <Route path="/batch-export" element={<BatchExport />} />
         </Routes>
       </Router>
     </ThemeProvider>
